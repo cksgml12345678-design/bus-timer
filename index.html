@@ -424,4 +424,344 @@
         return;
       }
 
-      if (manual || !hasSaved
+      if (manual || !hasSavedPos) showStatus('내 위치 찾는 중...');
+
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const newLat = pos.coords.latitude;
+          const newLng = pos.coords.longitude;
+          const moved = getDistanceMeters(currentLat, currentLng, newLat, newLng);
+
+          currentLat = newLat;
+          currentLng = newLng;
+          savePosition(newLat, newLng);
+
+          // 자동 시작 시 이전 위치에서 80m 이내면 중복 API 호출 생략
+          if (!manual && hasSavedPos && moved < 80) {
+            drawCenterAndCircle();
+            return;
+          }
+
+          hasSavedPos = true;
+          drawCenterAndCircle();
+          loadBuses();
+        },
+        () => {
+          if (manual || !hasSavedPos) {
+            showStatus('GPS를 켜지 않아 기본 위치로 표시합니다.', false, 2500);
+            drawCenterAndCircle();
+            loadBuses();
+          }
+        },
+        {
+          enableHighAccuracy: manual,
+          timeout: manual ? 6500 : 4000,
+          maximumAge: manual ? 5000 : 30000
+        }
+      );
+    }
+
+    function searchAtMapCenter() {
+      const center = map.getCenter();
+      currentLat = center.getLat();
+      currentLng = center.getLng();
+      document.getElementById('recenterSearchBtn').classList.remove('show');
+      drawCenterAndCircle();
+      loadBuses();
+    }
+
+    function setRadius(radius) {
+      currentRadius = radius;
+      document.querySelectorAll('.radius-btn').forEach((btn) => {
+        btn.classList.toggle('active', Number(btn.dataset.radius) === radius);
+      });
+      drawCenterAndCircle();
+      loadBuses();
+    }
+
+    function toggleMode() {
+      displayMode = displayMode === 'senior' ? 'timer' : 'senior';
+      const btn = document.getElementById('modeBtn');
+      btn.textContent = displayMode === 'senior' ? '큰글씨 (3분)' : '타이머 (02:45)';
+      updateBadgeTimes();
+      if (activeSheetStop) renderSheetContent();
+    }
+
+    async function loadBuses(silent = false) {
+      const seq = ++requestSeq;
+      if (!silent) showStatus(`${currentRadius}m 주변 버스 불러오는 중...`);
+
+      try {
+        const res = await fetch(`/api/bus?lat=${currentLat}&lng=${currentLng}&radius=${currentRadius}`);
+        const data = await res.json();
+        if (seq !== requestSeq) return;
+        if (!res.ok) throw new Error(data.error || '데이터를 불러오지 못했습니다.');
+
+        const fetchedAt = data.fetchedAt || Date.now();
+        lastFetchedAt = fetchedAt;
+        latestStops = (data.stops || []).map((s) => ({ ...s, _fetchedAt: fetchedAt }));
+
+        // 1단계: 도착 시간 배지부터 즉시 화면에 표시
+        renderStopBadges();
+
+        if (activeSheetStop) {
+          const updated = latestStops.find((s) => s.nodeId === activeSheetStop.nodeId);
+          if (updated) {
+            activeSheetStop = updated;
+            renderSheetContent();
+          }
+        }
+
+        const activeCount = latestStops.filter((s) => s.arrivals && s.arrivals.length > 0).length;
+        if (latestStops.length === 0) {
+          showStatus(`반경 ${currentRadius}m 안에 정류장이 없습니다. 거리를 넓혀보세요.`, false, 3500);
+        } else if (activeCount === 0) {
+          showStatus(`정류장 ${latestStops.length}곳 연결됨 (현재 도착 예정 버스 없음)`, false, 3500);
+        } else if (!silent) {
+          hideStatus();
+        }
+
+        // 2단계: 방향 화살표·방면 안내는 백그라운드에서 이어서 부착
+        if (activeCount > 0) {
+          loadDirectionsForStops(latestStops, seq);
+        }
+      } catch (err) {
+        if (seq === requestSeq) showStatus(err.message, true);
+      }
+    }
+
+    async function loadDirectionsForStops(stops, seq = null) {
+      const itemSet = new Set();
+      for (const stop of stops) {
+        const first = stop.arrivals && stop.arrivals[0];
+        if (first && first.routeId && itemSet.size < 16) {
+          itemSet.add(`${stop.cityCode}|${first.routeId}|${stop.nodeId}`);
+        }
+      }
+      for (const stop of stops) {
+        for (const bus of (stop.arrivals || []).slice(1, 5)) {
+          if (bus.routeId && itemSet.size < 16) {
+            itemSet.add(`${stop.cityCode}|${bus.routeId}|${stop.nodeId}`);
+          }
+        }
+      }
+
+      if (itemSet.size === 0) return;
+
+      try {
+        const query = encodeURIComponent(Array.from(itemSet).join(','));
+        const res = await fetch(`/api/bus?action=directions&items=${query}`);
+        if (!res.ok) return;
+        const data = await res.json();
+        if (seq !== null && seq !== requestSeq) return;
+
+        const dirs = data.directions || {};
+        let changed = false;
+
+        for (const stop of stops) {
+          for (const bus of stop.arrivals || []) {
+            const key = `${stop.cityCode}|${bus.routeId}|${stop.nodeId}`;
+            if (dirs[key]) {
+              bus.bearing = dirs[key].bearing;
+              bus.nextStop = dirs[key].nextStop;
+              changed = true;
+            }
+          }
+        }
+
+        if (changed) {
+          renderStopBadges();
+          if (activeSheetStop) renderSheetContent();
+        }
+      } catch {}
+    }
+
+    function renderStopBadges() {
+      stopOverlays.forEach((ov) => ov.setMap(null));
+      stopOverlays = [];
+      badgeRefs = [];
+
+      latestStops.forEach((stop) => {
+        const el = document.createElement('div');
+        const fastest = stop.arrivals && stop.arrivals[0];
+
+        if (fastest) {
+          const rem = getRemainingSec(fastest.arrTime, stop._fetchedAt);
+          const isUrgent = rem <= 180;
+          const arrowHtml =
+            typeof fastest.bearing === 'number'
+              ? `<span class="dir-wrap"><span class="dir-arrow" style="transform:rotate(${fastest.bearing}deg)">▲</span></span>`
+              : '';
+
+          el.className = 'stop-badge' + (isUrgent ? ' urgent' : '');
+          el.innerHTML = `
+            <div class="badge-main">
+              ${arrowHtml}
+              <span class="bus-num">${escapeHtml(fastest.routeNo)}</span>
+              <span class="bus-time">${formatTime(rem)}</span>
+            </div>
+            <div class="badge-sub">${escapeHtml(stop.name)}</div>
+          `;
+        } else {
+          el.className = 'stop-badge idle';
+          el.innerHTML = `
+            <div class="badge-idle-text">대기중</div>
+            <div class="badge-sub">${escapeHtml(stop.name)}</div>
+          `;
+        }
+
+        el.addEventListener('click', () => openSheet(stop));
+
+        const overlay = new kakao.maps.CustomOverlay({
+          position: new kakao.maps.LatLng(stop.lat, stop.lng),
+          content: el,
+          yAnchor: 1,
+          zIndex: fastest ? 15 : 10,
+          clickable: true
+        });
+        overlay.setMap(map);
+        stopOverlays.push(overlay);
+        badgeRefs.push({ el, stop });
+      });
+    }
+
+    function updateBadgeTimes() {
+      for (const item of badgeRefs) {
+        const fastest = item.stop.arrivals && item.stop.arrivals[0];
+        if (!fastest) continue;
+
+        const rem = getRemainingSec(fastest.arrTime, item.stop._fetchedAt);
+        const isUrgent = rem <= 180;
+        item.el.classList.toggle('urgent', isUrgent);
+        const timeEl = item.el.querySelector('.bus-time');
+        if (timeEl) timeEl.textContent = formatTime(rem);
+      }
+    }
+
+    function openSheet(stop) {
+      activeSheetStop = stop;
+      sheetOppositeStop = stop.oppositeStop || null;
+      renderSheetContent();
+      document.getElementById('sheetBackdrop').classList.add('open');
+      document.getElementById('bottomSheet').classList.add('open');
+    }
+
+    function closeSheet() {
+      activeSheetStop = null;
+      sheetOppositeStop = null;
+      document.getElementById('sheetBackdrop').classList.remove('open');
+      document.getElementById('bottomSheet').classList.remove('open');
+    }
+
+    async function switchToOppositeStop() {
+      if (!sheetOppositeStop || !activeSheetStop) return;
+
+      const prevStop = activeSheetStop;
+      const targetStop = sheetOppositeStop;
+
+      // 이미 지도 목록에 불러와둔 정류장이면 즉시 전환
+      const existing = latestStops.find((s) => s.nodeId === targetStop.nodeId);
+      if (existing) {
+        activeSheetStop = existing;
+        sheetOppositeStop = prevStop;
+        renderSheetContent();
+        return;
+      }
+
+      activeSheetStop = { ...targetStop, arrivals: null };
+      sheetOppositeStop = prevStop;
+      renderSheetContent();
+
+      try {
+        const url = `/api/bus?action=stop&cityCode=${encodeURIComponent(targetStop.cityCode)}&nodeId=${encodeURIComponent(targetStop.nodeId)}`;
+        const res = await fetch(url);
+        const data = await res.json();
+        if (!activeSheetStop || activeSheetStop.nodeId !== targetStop.nodeId) return;
+
+        activeSheetStop = {
+          ...targetStop,
+          arrivals: data.arrivals || [],
+          _fetchedAt: data.fetchedAt || Date.now()
+        };
+        renderSheetContent();
+
+        if (activeSheetStop.arrivals.length > 0) {
+          loadDirectionsForStops([activeSheetStop], null);
+        }
+      } catch {
+        if (activeSheetStop && activeSheetStop.nodeId === targetStop.nodeId) {
+          activeSheetStop = { ...targetStop, arrivals: [] };
+          renderSheetContent();
+        }
+      }
+    }
+
+    function renderSheetContent() {
+      const stop = activeSheetStop;
+      if (!stop) return;
+
+      document.getElementById('sheetTitle').textContent = stop.name;
+      const noText = stop.nodeNo ? `정류장 번호 ${stop.nodeNo} · ` : '';
+      document.getElementById('sheetMeta').textContent = `${noText}약 ${stop.distance}m 거리`;
+
+      const oppBar = document.getElementById('oppositeBar');
+      const oppBtn = document.getElementById('oppositeBtn');
+      if (sheetOppositeStop) {
+        const oppLabel = sheetOppositeStop.nodeNo
+          ? `(${sheetOppositeStop.nodeNo})`
+          : sheetOppositeStop.name !== stop.name
+          ? `(${sheetOppositeStop.name})`
+          : '';
+        oppBtn.textContent = `⇄ 길 건너 반대편 정류장 보기 ${oppLabel}`.trim();
+        oppBar.classList.add('show');
+      } else {
+        oppBar.classList.remove('show');
+      }
+
+      const listEl = document.getElementById('sheetList');
+      if (stop.arrivals === null) {
+        listEl.innerHTML = `<div class="empty-msg">반대편 정류장 버스 불러오는 중...</div>`;
+        return;
+      }
+
+      if (!stop.arrivals || stop.arrivals.length === 0) {
+        listEl.innerHTML = `
+          <div class="empty-msg">
+            현재 도착 예정인 버스가 없습니다.<br/>
+            (심야 시간이거나 첫차 대기 중일 수 있습니다)
+          </div>
+        `;
+        return;
+      }
+
+      listEl.innerHTML = stop.arrivals.map((bus) => {
+        const rem = getRemainingSec(bus.arrTime, stop._fetchedAt);
+        const isUrgent = rem <= 180;
+        const arrowHtml =
+          typeof bus.bearing === 'number'
+            ? `<span class="row-dir-wrap"><span class="dir-arrow" style="transform:rotate(${bus.bearing}deg)">▲</span></span>`
+            : '';
+        const dirText = bus.nextStop
+          ? (bus.nextStop === '종점' ? '종점 도착 · ' : `${escapeHtml(bus.nextStop)} 방면 · `)
+          : '';
+        const lowFloor = bus.vehicleType.includes('저상') ? ' · 저상버스' : '';
+
+        return `
+          <div class="arrival-row ${isUrgent ? 'urgent' : ''}">
+            <div class="row-left">
+              <div class="row-route-line">
+                ${arrowHtml}
+                <div class="row-route">${escapeHtml(bus.routeNo)}번</div>
+              </div>
+              <div class="row-info">${dirText}${bus.prevStations}정거장 전${escapeHtml(lowFloor)}</div>
+            </div>
+            <div class="row-time">${formatTime(rem)}</div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    window.addEventListener('load', initMap);
+  </script>
+</body>
+</html>
