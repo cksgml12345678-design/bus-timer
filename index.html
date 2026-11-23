@@ -4,8 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
   <meta name="theme-color" content="#111827" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
   <title>내 주변 버스 타이머</title>
   <link rel="manifest" href="/manifest.json" />
+  <link rel="icon" type="image/png" href="/api/bus?action=icon&size=192" />
+  <link rel="apple-touch-icon" href="/api/bus?action=icon&size=192" />
   <style>
     * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
     html, body {
@@ -59,7 +62,7 @@
     }
     .recenter-search.show { display: block; }
 
-    /* 하단 거리 선택 버튼 (250m / 500m / 1km) */
+    /* 하단 거리 선택 버튼 */
     .bottom-bar {
       position: fixed; bottom: 0; left: 0; right: 0; z-index: 25;
       background: #ffffff; border-top: 2px solid #e5e7eb;
@@ -150,14 +153,14 @@
     .bottom-sheet {
       position: fixed; left: 0; right: 0; bottom: 0; z-index: 50;
       background: #ffffff; border-radius: 24px 24px 0 0;
-      max-height: 75vh; display: flex; flex-direction: column;
-      transform: translateY(105%); transition: transform 0.25s ease-out;
+      max-height: 78vh; display: flex; flex-direction: column;
+      transform: translateY(105%); transition: transform 0.22s ease-out;
       box-shadow: 0 -10px 30px rgba(0,0,0,0.25);
     }
     .bottom-sheet.open { transform: translateY(0); }
 
     .sheet-header {
-      padding: 20px 20px 14px; border-bottom: 2px solid #f3f4f6;
+      padding: 18px 20px 12px; border-bottom: 2px solid #f3f4f6;
       display: flex; justify-content: space-between; align-items: flex-start; gap: 12px;
     }
     .sheet-title { font-size: 22px; font-weight: 900; color: #111827; margin: 0; }
@@ -165,7 +168,21 @@
     .sheet-close {
       background: #e5e7eb; border: none; border-radius: 12px;
       padding: 10px 16px; font-size: 16px; font-weight: 800; color: #111827; cursor: pointer;
+      flex-shrink: 0;
     }
+
+    /* 반대편 정류장 전환 버튼 */
+    .opposite-bar {
+      padding: 10px 16px 0;
+      display: none;
+    }
+    .opposite-bar.show { display: block; }
+    .opposite-btn {
+      width: 100%; background: #eff6ff; border: 2px solid #2563eb; border-radius: 14px;
+      padding: 12px 14px; font-size: 16px; font-weight: 800; color: #1d4ed8;
+      cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 8px;
+    }
+    .opposite-btn:active { background: #dbeafe; }
 
     .sheet-list {
       padding: 12px 16px calc(env(safe-area-inset-bottom, 16px) + 20px);
@@ -202,7 +219,7 @@
   <div class="top-bar">
     <button id="modeBtn" class="pill-btn dark" onclick="toggleMode()">큰글씨 (3분)</button>
     <div class="right-controls">
-      <button class="pill-btn" onclick="moveToMyGPS()">📍 내 위치</button>
+      <button class="pill-btn" onclick="moveToMyGPS(true)">📍 내 위치</button>
       <button class="pill-btn" onclick="loadBuses()">🔄 갱신</button>
     </div>
   </div>
@@ -227,16 +244,29 @@
       </div>
       <button class="sheet-close" onclick="closeSheet()">닫기</button>
     </div>
+    <div id="oppositeBar" class="opposite-bar">
+      <button id="oppositeBtn" class="opposite-btn" onclick="switchToOppositeStop()">⇄ 길 건너 반대편 정류장 보기</button>
+    </div>
     <div id="sheetList" class="sheet-list"></div>
   </div>
 
-  <!-- ★ 아래 '여기에_카카오_자바스크립트_키_입력'만 본인 키로 바꾸세요! -->
-  <script type="text/javascript" src="https://dapi.kakao.com/v2/maps/sdk.js?appkey=92e184f7d7f6bd6672e174c138aec6e7
-"></script>
+  <script type="text/javascript" src="https://dapi.kakao.com/v2/maps/sdk.js?appkey=92e184f7d7f6bd6672e174c138aec6e7"></script>
 
   <script>
+    const LAST_POS_KEY = 'bus_timer_last_pos';
     let currentLat = 37.4649;
     let currentLng = 126.6801;
+    let hasSavedPos = false;
+
+    try {
+      const saved = JSON.parse(localStorage.getItem(LAST_POS_KEY) || 'null');
+      if (saved && typeof saved.lat === 'number' && typeof saved.lng === 'number') {
+        currentLat = saved.lat;
+        currentLng = saved.lng;
+        hasSavedPos = true;
+      }
+    } catch {}
+
     let currentRadius = 250;
     let displayMode = 'senior'; // 'senior' (3분) | 'timer' (02:45)
 
@@ -244,14 +274,35 @@
     let radiusCircle = null;
     let myDotOverlay = null;
     let stopOverlays = [];
+    let badgeRefs = [];
     let latestStops = [];
-    let lastFetchedAt = Date.now();
-    let openedStopId = null;
+    let lastFetchedAt = 0;
+    let requestSeq = 0;
+
+    let activeSheetStop = null;
+    let sheetOppositeStop = null;
 
     function escapeHtml(str) {
       return String(str)
         .replace(/&/g, '&').replace(/</g, '<')
         .replace(/>/g, '>').replace(/"/g, '"');
+    }
+
+    function getDistanceMeters(lat1, lng1, lat2, lng2) {
+      const R = 6371000;
+      const toRad = (d) => (d * Math.PI) / 180;
+      const dLat = toRad(lat2 - lat1);
+      const dLng = toRad(lng2 - lng1);
+      const a =
+        Math.sin(dLat / 2) ** 2 +
+        Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+      return Math.round(2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
+    }
+
+    function savePosition(lat, lng) {
+      try {
+        localStorage.setItem(LAST_POS_KEY, JSON.stringify({ lat, lng }));
+      } catch {}
     }
 
     function showStatus(msg, isError = false, autoHideMs = 0) {
@@ -279,8 +330,9 @@
       return `${m}:${String(s).padStart(2, '0')}`;
     }
 
-    function getRemainingSec(arrTime) {
-      const elapsed = Math.floor((Date.now() - lastFetchedAt) / 1000);
+    function getRemainingSec(arrTime, fetchedAt) {
+      const base = fetchedAt || lastFetchedAt || Date.now();
+      const elapsed = Math.floor((Date.now() - base) / 1000);
       return Math.max(0, arrTime - elapsed);
     }
 
@@ -291,8 +343,12 @@
     }
 
     function initMap() {
+      if ('serviceWorker' in navigator) {
+        navigator.serviceWorker.register('/sw.js').catch(() => {});
+      }
+
       if (typeof kakao === 'undefined' || !kakao.maps) {
-        showStatus('카카오맵 로드 실패: index.html의 JavaScript 키와 카카오 도메인 등록을 확인하세요.', true);
+        showStatus('카카오맵 로드 실패: 카카오 도메인 등록을 확인하세요.', true);
         return;
       }
 
@@ -306,18 +362,30 @@
         document.getElementById('recenterSearchBtn').classList.add('show');
       });
 
-      moveToMyGPS();
+      // 직전 위치가 저장되어 있으면 GPS 대기 없이 0.1초 만에 즉시 로딩 시작
+      drawCenterAndCircle();
+      if (hasSavedPos) {
+        loadBuses();
+      }
+      moveToMyGPS(false);
 
+      // 1초마다 오버레이 재생성 없이 시간 글자만 가볍게 갱신
       setInterval(() => {
-        if (latestStops.length > 0) {
-          renderStopBadges();
-          if (openedStopId) renderSheetContent();
-        }
+        updateBadgeTimes();
+        if (activeSheetStop) renderSheetContent();
       }, 1000);
 
+      // 60초마다 자동 새로고침
       setInterval(() => {
         if (document.visibilityState === 'visible') loadBuses(true);
       }, 60000);
+
+      // 다른 앱 보다가 다시 돌아왔을 때 30초 넘었으면 조용히 최신화
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && Date.now() - lastFetchedAt > 30000) {
+          loadBuses(true);
+        }
+      });
     }
 
     function drawCenterAndCircle() {
@@ -346,187 +414,14 @@
       myDotOverlay.setMap(map);
     }
 
-    function moveToMyGPS() {
+    function moveToMyGPS(manual = true) {
       document.getElementById('recenterSearchBtn').classList.remove('show');
       if (!navigator.geolocation) {
-        drawCenterAndCircle();
-        loadBuses();
+        if (!hasSavedPos || manual) {
+          drawCenterAndCircle();
+          loadBuses();
+        }
         return;
       }
 
-      showStatus('내 위치 찾는 중...');
-      navigator.geolocation.getCurrentPosition(
-        (pos) => {
-          currentLat = pos.coords.latitude;
-          currentLng = pos.coords.longitude;
-          drawCenterAndCircle();
-          loadBuses();
-        },
-        () => {
-          showStatus('GPS를 켜지 않아 기본 위치로 표시합니다.', false, 3000);
-          drawCenterAndCircle();
-          loadBuses();
-        },
-        { enableHighAccuracy: true, timeout: 7000, maximumAge: 10000 }
-      );
-    }
-
-    function searchAtMapCenter() {
-      const center = map.getCenter();
-      currentLat = center.getLat();
-      currentLng = center.getLng();
-      document.getElementById('recenterSearchBtn').classList.remove('show');
-      drawCenterAndCircle();
-      loadBuses();
-    }
-
-    function setRadius(radius) {
-      currentRadius = radius;
-      document.querySelectorAll('.radius-btn').forEach((btn) => {
-        btn.classList.toggle('active', Number(btn.dataset.radius) === radius);
-      });
-      drawCenterAndCircle();
-      loadBuses();
-    }
-
-    function toggleMode() {
-      displayMode = displayMode === 'senior' ? 'timer' : 'senior';
-      const btn = document.getElementById('modeBtn');
-      btn.textContent = displayMode === 'senior' ? '큰글씨 (3분)' : '타이머 (02:45)';
-      renderStopBadges();
-      if (openedStopId) renderSheetContent();
-    }
-
-    async function loadBuses(silent = false) {
-      if (!silent) showStatus(`${currentRadius}m 주변 버스 불러오는 중...`);
-      try {
-        const res = await fetch(`/api/bus?lat=${currentLat}&lng=${currentLng}&radius=${currentRadius}`);
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || '데이터를 불러오지 못했습니다.');
-
-        latestStops = data.stops || [];
-        lastFetchedAt = data.fetchedAt || Date.now();
-        renderStopBadges();
-        if (openedStopId) renderSheetContent();
-
-        const activeCount = latestStops.filter((s) => s.arrivals && s.arrivals.length > 0).length;
-        if (latestStops.length === 0) {
-          showStatus(`반경 ${currentRadius}m 안에 정류장이 없습니다. 거리를 넓혀보세요.`, false, 3500);
-        } else if (activeCount === 0) {
-          showStatus(`정류장 ${latestStops.length}곳 연결됨 (현재 도착 예정 버스 없음)`, false, 4000);
-        } else if (!silent) {
-          hideStatus();
-        }
-      } catch (err) {
-        showStatus(err.message, true);
-      }
-    }
-
-    function renderStopBadges() {
-      stopOverlays.forEach((ov) => ov.setMap(null));
-      stopOverlays = [];
-
-      latestStops.forEach((stop) => {
-        const el = document.createElement('div');
-        const fastest = stop.arrivals && stop.arrivals[0];
-
-        if (fastest) {
-          const rem = getRemainingSec(fastest.arrTime);
-          const isUrgent = rem <= 180;
-          const arrowHtml =
-            typeof fastest.bearing === 'number'
-              ? `<span class="dir-wrap"><span class="dir-arrow" style="transform:rotate(${fastest.bearing}deg)">▲</span></span>`
-              : '';
-
-          el.className = 'stop-badge' + (isUrgent ? ' urgent' : '');
-          el.innerHTML = `
-            <div class="badge-main">
-              ${arrowHtml}
-              <span class="bus-num">${escapeHtml(fastest.routeNo)}</span>
-              <span class="bus-time">${formatTime(rem)}</span>
-            </div>
-            <div class="badge-sub">${escapeHtml(stop.name)}</div>
-          `;
-        } else {
-          el.className = 'stop-badge idle';
-          el.innerHTML = `
-            <div class="badge-idle-text">대기중</div>
-            <div class="badge-sub">${escapeHtml(stop.name)}</div>
-          `;
-        }
-
-        el.addEventListener('click', () => openSheet(stop.nodeId));
-
-        const overlay = new kakao.maps.CustomOverlay({
-          position: new kakao.maps.LatLng(stop.lat, stop.lng),
-          content: el,
-          yAnchor: 1,
-          zIndex: fastest ? 15 : 10,
-          clickable: true
-        });
-        overlay.setMap(map);
-        stopOverlays.push(overlay);
-      });
-    }
-
-    function openSheet(nodeId) {
-      openedStopId = nodeId;
-      renderSheetContent();
-      document.getElementById('sheetBackdrop').classList.add('open');
-      document.getElementById('bottomSheet').classList.add('open');
-    }
-
-    function closeSheet() {
-      openedStopId = null;
-      document.getElementById('sheetBackdrop').classList.remove('open');
-      document.getElementById('bottomSheet').classList.remove('open');
-    }
-
-    function renderSheetContent() {
-      const stop = latestStops.find((s) => s.nodeId === openedStopId);
-      if (!stop) return;
-
-      document.getElementById('sheetTitle').textContent = stop.name;
-      const noText = stop.nodeNo ? `정류장 번호 ${stop.nodeNo} · ` : '';
-      document.getElementById('sheetMeta').textContent = `${noText}약 ${stop.distance}m 거리`;
-
-      const listEl = document.getElementById('sheetList');
-      if (!stop.arrivals || stop.arrivals.length === 0) {
-        listEl.innerHTML = `
-          <div class="empty-msg">
-            현재 도착 예정인 버스가 없습니다.<br/>
-            (심야 시간이거나 첫차 대기 중일 수 있습니다)
-          </div>
-        `;
-        return;
-      }
-
-      listEl.innerHTML = stop.arrivals.map((bus) => {
-        const rem = getRemainingSec(bus.arrTime);
-        const isUrgent = rem <= 180;
-        const arrowHtml =
-          typeof bus.bearing === 'number'
-            ? `<span class="row-dir-wrap"><span class="dir-arrow" style="transform:rotate(${bus.bearing}deg)">▲</span></span>`
-            : '';
-        const dirText = bus.nextStop ? (bus.nextStop === '종점' ? '종점 도착 · ' : `${escapeHtml(bus.nextStop)} 방면 · `) : '';
-        const lowFloor = bus.vehicleType.includes('저상') ? ' · 저상버스' : '';
-
-        return `
-          <div class="arrival-row ${isUrgent ? 'urgent' : ''}">
-            <div class="row-left">
-              <div class="row-route-line">
-                ${arrowHtml}
-                <div class="row-route">${escapeHtml(bus.routeNo)}번</div>
-              </div>
-              <div class="row-info">${dirText}${bus.prevStations}정거장 전${escapeHtml(lowFloor)}</div>
-            </div>
-            <div class="row-time">${formatTime(rem)}</div>
-          </div>
-        `;
-      }).join('');
-    }
-
-    window.addEventListener('load', initMap);
-  </script>
-</body>
-</html>
+      if (manual || !hasSaved
