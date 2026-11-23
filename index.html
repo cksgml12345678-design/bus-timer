@@ -80,7 +80,7 @@
     /* 지도 위 A안 타이머 배지 */
     .stop-badge {
       position: relative; background: #ffffff; border: 3px solid #111827;
-      border-radius: 14px; padding: 6px 10px; min-width: 108px;
+      border-radius: 14px; padding: 6px 9px; min-width: 104px;
       box-shadow: 0 6px 16px rgba(0, 0, 0, 0.25); cursor: pointer;
       text-align: center; transform: translateY(-8px);
     }
@@ -95,7 +95,7 @@
     }
     .stop-badge.urgent::after { border-top-color: #dc2626; }
     .stop-badge.idle {
-      border-color: #6b7280; background: #f3f4f6; min-width: 84px; padding: 5px 8px; opacity: 0.92;
+      border-color: #6b7280; background: #f3f4f6; min-width: 82px; padding: 5px 8px; opacity: 0.92;
     }
     .stop-badge.idle::after { border-top-color: #6b7280; }
 
@@ -105,21 +105,32 @@
     }
 
     .badge-main {
-      display: flex; align-items: center; justify-content: center; gap: 6px;
+      display: flex; align-items: center; justify-content: center; gap: 5px;
       line-height: 1.1;
     }
+    .dir-wrap {
+      width: 22px; height: 22px; border-radius: 50%;
+      background: #111827; color: #ffffff;
+      display: inline-flex; align-items: center; justify-content: center;
+      flex-shrink: 0;
+    }
+    .stop-badge.urgent .dir-wrap { background: #dc2626; }
+    .dir-arrow {
+      display: inline-block; font-size: 11px; line-height: 1; font-weight: 900;
+    }
+
     .bus-num {
-      background: #2563eb; color: #ffffff; font-size: 16px; font-weight: 900;
-      padding: 3px 7px; border-radius: 7px; letter-spacing: -0.5px;
+      background: #2563eb; color: #ffffff; font-size: 15px; font-weight: 900;
+      padding: 3px 6px; border-radius: 7px; letter-spacing: -0.5px;
     }
     .stop-badge.urgent .bus-num { background: #dc2626; }
     .bus-time {
-      font-size: 20px; font-weight: 900; color: #111827; letter-spacing: -0.5px;
+      font-size: 19px; font-weight: 900; color: #111827; letter-spacing: -0.5px;
     }
     .stop-badge.urgent .bus-time { color: #dc2626; }
     .badge-sub {
       margin-top: 3px; font-size: 12px; font-weight: 700; color: #4b5563;
-      max-width: 135px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      max-width: 130px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
     }
     .badge-idle-text { font-size: 13px; font-weight: 800; color: #4b5563; }
 
@@ -166,10 +177,17 @@
     }
     .arrival-row.urgent { background: #fef2f2; border-color: #fca5a5; }
     .row-left { display: flex; flex-direction: column; gap: 4px; }
+    .row-route-line { display: flex; align-items: center; gap: 8px; }
     .row-route { font-size: 24px; font-weight: 900; color: #1d4ed8; }
     .arrival-row.urgent .row-route { color: #dc2626; }
-    .row-info { font-size: 14px; font-weight: 700; color: #4b5563; }
-    .row-time { font-size: 26px; font-weight: 900; color: #111827; text-align: right; }
+    .row-dir-wrap {
+      width: 26px; height: 26px; border-radius: 50%;
+      background: #111827; color: #ffffff;
+      display: inline-flex; align-items: center; justify-content: center;
+    }
+    .arrival-row.urgent .row-dir-wrap { background: #dc2626; }
+    .row-info { font-size: 15px; font-weight: 700; color: #4b5563; }
+    .row-time { font-size: 26px; font-weight: 900; color: #111827; text-align: right; white-space: nowrap; }
     .arrival-row.urgent .row-time { color: #dc2626; }
     .empty-msg {
       text-align: center; padding: 36px 12px; font-size: 18px; font-weight: 700; color: #6b7280;
@@ -213,10 +231,10 @@
   </div>
 
   <!-- ★ 아래 '여기에_카카오_자바스크립트_키_입력'만 본인 키로 바꾸세요! -->
-  <script type="text/javascript" src="https://dapi.kakao.com/v2/maps/sdk.js?appkey=92e184f7d7f6bd6672e174c138aec6e7"></script>
+  <script type="text/javascript" src="https://dapi.kakao.com/v2/maps/sdk.js?appkey=92e184f7d7f6bd6672e174c138aec6e7
+"></script>
 
   <script>
-    // 기본 위치 (GPS 권한 거부 또는 PC 테스트용 초기 좌표: 주안역 인근)
     let currentLat = 37.4649;
     let currentLng = 126.6801;
     let currentRadius = 250;
@@ -250,7 +268,9 @@
     }
 
     function formatTime(remainingSec) {
-      if (remainingSec <= 60) return displayMode === 'senior' ? '곧 도착' : `0:${String(Math.max(0, remainingSec)).padStart(2, '0')}`;
+      if (remainingSec <= 60) {
+        return displayMode === 'senior' ? '곧 도착' : `0:${String(Math.max(0, remainingSec)).padStart(2, '0')}`;
+      }
       if (displayMode === 'senior') {
         return `${Math.ceil(remainingSec / 60)}분`;
       }
@@ -288,7 +308,6 @@
 
       moveToMyGPS();
 
-      // 1초마다 화면 카운트다운만 자체 갱신 (API 호출 0건)
       setInterval(() => {
         if (latestStops.length > 0) {
           renderStopBadges();
@@ -296,7 +315,6 @@
         }
       }, 1000);
 
-      // 60초마다 실제 서버 데이터 자동 새로고침
       setInterval(() => {
         if (document.visibilityState === 'visible') loadBuses(true);
       }, 60000);
@@ -408,21 +426,22 @@
       stopOverlays.forEach((ov) => ov.setMap(null));
       stopOverlays = [];
 
-      // 운행 중인 버스가 있는 정류장을 우선으로 최대 6곳만 지도에 깔끔하게 표시
-      const activeStops = latestStops.filter((s) => s.arrivals && s.arrivals.length > 0);
-      const idleStops = latestStops.filter((s) => !s.arrivals || s.arrivals.length === 0);
-      const visibleStops = [...activeStops.slice(0, 6), ...idleStops.slice(0, Math.max(0, 5 - activeStops.length))];
-
-      visibleStops.forEach((stop) => {
+      latestStops.forEach((stop) => {
         const el = document.createElement('div');
         const fastest = stop.arrivals && stop.arrivals[0];
 
         if (fastest) {
           const rem = getRemainingSec(fastest.arrTime);
           const isUrgent = rem <= 180;
+          const arrowHtml =
+            typeof fastest.bearing === 'number'
+              ? `<span class="dir-wrap"><span class="dir-arrow" style="transform:rotate(${fastest.bearing}deg)">▲</span></span>`
+              : '';
+
           el.className = 'stop-badge' + (isUrgent ? ' urgent' : '');
           el.innerHTML = `
             <div class="badge-main">
+              ${arrowHtml}
               <span class="bus-num">${escapeHtml(fastest.routeNo)}</span>
               <span class="bus-time">${formatTime(rem)}</span>
             </div>
@@ -485,12 +504,21 @@
       listEl.innerHTML = stop.arrivals.map((bus) => {
         const rem = getRemainingSec(bus.arrTime);
         const isUrgent = rem <= 180;
+        const arrowHtml =
+          typeof bus.bearing === 'number'
+            ? `<span class="row-dir-wrap"><span class="dir-arrow" style="transform:rotate(${bus.bearing}deg)">▲</span></span>`
+            : '';
+        const dirText = bus.nextStop ? (bus.nextStop === '종점' ? '종점 도착 · ' : `${escapeHtml(bus.nextStop)} 방면 · `) : '';
         const lowFloor = bus.vehicleType.includes('저상') ? ' · 저상버스' : '';
+
         return `
           <div class="arrival-row ${isUrgent ? 'urgent' : ''}">
             <div class="row-left">
-              <div class="row-route">${escapeHtml(bus.routeNo)}번</div>
-              <div class="row-info">${bus.prevStations}정거장 전${escapeHtml(lowFloor)}</div>
+              <div class="row-route-line">
+                ${arrowHtml}
+                <div class="row-route">${escapeHtml(bus.routeNo)}번</div>
+              </div>
+              <div class="row-info">${dirText}${bus.prevStations}정거장 전${escapeHtml(lowFloor)}</div>
             </div>
             <div class="row-time">${formatTime(rem)}</div>
           </div>
