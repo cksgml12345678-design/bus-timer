@@ -1,9 +1,12 @@
 // api/bus.js
 const zlib = require('zlib');
 
+const nearbyStopCache = new Map();
 const routeStopCache = new Map();
 const iconCache = new Map();
-const ROUTE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6시간 캐시
+
+const STOP_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 정류장 위치 24시간 캐시
+const ROUTE_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 노선 경유지 6시간 캐시
 
 function crc32(buf) {
   let c = 0xffffffff;
@@ -37,23 +40,23 @@ function createBusIconPng(size) {
 
     for (let x = 0; x < s; x++) {
       const nx = x / s;
-      let r = 17, g = 24, b = 39; // #111827 배경
+      let r = 17, g = 24, b = 39;
 
       const dx = nx - 0.5;
       const dy = ny - 0.5;
       if (dx * dx + dy * dy <= 0.41 * 0.41) {
-        r = 37; g = 99; b = 235; // #2563eb 원형 배지
+        r = 37; g = 99; b = 235;
       }
 
       if (nx >= 0.28 && nx <= 0.72 && ny >= 0.25 && ny <= 0.71) {
-        r = 255; g = 255; b = 255; // 버스 본체
+        r = 255; g = 255; b = 255;
         if (nx >= 0.33 && nx <= 0.67 && ny >= 0.32 && ny <= 0.52) {
-          r = 17; g = 24; b = 39; // 앞유리
+          r = 17; g = 24; b = 39;
         }
         const leftLight = nx >= 0.34 && nx <= 0.42 && ny >= 0.59 && ny <= 0.65;
         const rightLight = nx >= 0.58 && nx <= 0.66 && ny >= 0.59 && ny <= 0.65;
         if (leftLight || rightLight) {
-          r = 250; g = 204; b = 21; // 노란 헤드라이트
+          r = 250; g = 204; b = 21;
         }
       }
 
@@ -88,35 +91,43 @@ function createBusIconPng(size) {
   return png;
 }
 
-async function fetchWithTimeout(url, timeoutMs = 5500) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(url, { signal: controller.signal });
-  } finally {
-    clearTimeout(timer);
+async function fetchTago(url, timeoutMs = 10000, retries = 0) {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const response = await fetch(url, { signal: controller.signal });
+      const text = await response.text();
+
+      if (text.trim().startsWith('<')) {
+        const msgMatch = text.match(/<returnAuthMsg>([^<]+)<\/returnAuthMsg>/);
+        const authMsg = msgMatch ? msgMatch[1] : 'API 인증 오류';
+        throw new Error(`공공데이터 응답 오류(${authMsg}): 승인 직후라면 최대 1시간 뒤 자동 활성화됩니다.`);
+      }
+
+      const data = JSON.parse(text);
+      const code = data?.response?.header?.resultCode;
+      if (code && code !== '00') {
+        throw new Error(`공공데이터 오류(${code}): ${data?.response?.header?.resultMsg || ''}`);
+      }
+
+      const item = data?.response?.body?.items?.item;
+      if (!item) return [];
+      return Array.isArray(item) ? item : [item];
+    } catch (err) {
+      const isAbort = err && (err.name === 'AbortError' || String(err.message).toLowerCase().includes('aborted'));
+      if (isAbort && attempt < retries) {
+        continue;
+      }
+      if (isAbort) {
+        throw new Error('공공데이터 서버 응답이 지연되고 있습니다. 잠시 후 🔄 갱신을 눌러주세요.');
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
-}
-
-async function fetchTago(url) {
-  const response = await fetchWithTimeout(url);
-  const text = await response.text();
-
-  if (text.trim().startsWith('<')) {
-    const msgMatch = text.match(/<returnAuthMsg>([^<]+)<\/returnAuthMsg>/);
-    const authMsg = msgMatch ? msgMatch[1] : 'API 인증 오류';
-    throw new Error(`공공데이터 응답 오류(${authMsg}): 승인 직후라면 최대 1시간 뒤 자동 활성화됩니다.`);
-  }
-
-  const data = JSON.parse(text);
-  const code = data?.response?.header?.resultCode;
-  if (code && code !== '00') {
-    throw new Error(`공공데이터 오류(${code}): ${data?.response?.header?.resultMsg || ''}`);
-  }
-
-  const item = data?.response?.body?.items?.item;
-  if (!item) return [];
-  return Array.isArray(item) ? item : [item];
+  return [];
 }
 
 function getDistanceMeters(lat1, lng1, lat2, lng2) {
@@ -130,13 +141,31 @@ function getDistanceMeters(lat1, lng1, lat2, lng2) {
   return Math.round(2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a)));
 }
 
+async function getNearbyStopsCached(serviceKey, ptLat, ptLng) {
+  const key = `${ptLat.toFixed(3)}:${ptLng.toFixed(3)}`;
+  const cached = nearbyStopCache.get(key);
+  if (cached && Date.now() - cached.savedAt < STOP_CACHE_TTL_MS) {
+    return cached.items;
+  }
+
+  const url =
+    `https://apis.data.go.kr/1613000/BusSttnInfoInqireService/getCrdntPrxmtSttnList` +
+    `?serviceKey=${serviceKey}&gpsLati=${ptLat}&gpsLong=${ptLng}&numOfRows=50&pageNo=1&_type=json`;
+
+  const items = await fetchTago(url, 10000, 1);
+  if (items.length > 0) {
+    nearbyStopCache.set(key, { savedAt: Date.now(), items });
+  }
+  return items;
+}
+
 async function getStopArrivals(serviceKey, cityCode, nodeId) {
   const url =
     `https://apis.data.go.kr/1613000/ArvlInfoInqireService/getSttnAcctoArvlPrearngeInfoList` +
     `?serviceKey=${serviceKey}&cityCode=${encodeURIComponent(cityCode)}` +
     `&nodeId=${encodeURIComponent(nodeId)}&numOfRows=30&pageNo=1&_type=json`;
 
-  const arrivalsRaw = await fetchTago(url);
+  const arrivalsRaw = await fetchTago(url, 9000, 0);
   return arrivalsRaw
     .map((a) => ({
       routeId: String(a.routeid || ''),
@@ -165,7 +194,7 @@ async function getRouteStops(serviceKey, cityCode, routeId) {
       `?serviceKey=${serviceKey}&cityCode=${encodeURIComponent(cityCode)}` +
       `&routeId=${encodeURIComponent(routeId)}&numOfRows=250&pageNo=1&_type=json`;
 
-    const raw = await fetchTago(url);
+    const raw = await fetchTago(url, 9000, 0);
     const stops = raw
       .map((x) => ({
         nodeId: String(x.nodeid || ''),
@@ -261,7 +290,7 @@ module.exports = async (req, res) => {
 
   const action = String(req.query.action || '');
 
-  // 1) 앱 설치용 PNG 아이콘 반환
+  // 1) 앱 설치용 PNG 아이콘
   if (action === 'icon') {
     const size = parseInt(req.query.size, 10) === 512 ? 512 : 192;
     const png = createBusIconPng(size);
@@ -278,14 +307,14 @@ module.exports = async (req, res) => {
   }
   const serviceKey = rawKey.includes('%') ? rawKey : encodeURIComponent(rawKey);
 
-  // 2) 방향 화살표·방면 안내만 백그라운드 별도 조회 (초기 로딩 차단 없음)
+  // 2) 방향 화살표·방면 안내 백그라운드 조회
   if (action === 'directions') {
     res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
     const rawItems = String(req.query.items || '')
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean)
-      .slice(0, 16);
+      .slice(0, 14);
 
     const parsed = rawItems
       .map((item) => {
@@ -335,7 +364,7 @@ module.exports = async (req, res) => {
     }
   }
 
-  // 4) 기본: 주변 정류장 + 도착 시간 초고속 조회
+  // 4) 기본: 주변 정류장 + 도착 시간 조회
   res.setHeader('Cache-Control', 's-maxage=15, stale-while-revalidate=30');
 
   const lat = parseFloat(req.query.lat);
@@ -358,12 +387,7 @@ module.exports = async (req, res) => {
     }
 
     const stopResults = await Promise.allSettled(
-      queryPoints.map((pt) => {
-        const url =
-          `https://apis.data.go.kr/1613000/BusSttnInfoInqireService/getCrdntPrxmtSttnList` +
-          `?serviceKey=${serviceKey}&gpsLati=${pt.lat}&gpsLong=${pt.lng}&numOfRows=50&pageNo=1&_type=json`;
-        return fetchTago(url);
-      })
+      queryPoints.map((pt) => getNearbyStopsCached(serviceKey, pt.lat, pt.lng))
     );
 
     const fulfilled = stopResults.filter((r) => r.status === 'fulfilled');
@@ -396,8 +420,8 @@ module.exports = async (req, res) => {
 
     const allStops = Array.from(stopMap.values()).sort((a, b) => a.distance - b.distance);
 
-    const preSpacing = radius >= 1000 ? 150 : radius >= 500 ? 65 : 0;
-    const maxCandidates = radius >= 1000 ? 15 : radius >= 500 ? 12 : 8;
+    const preSpacing = radius >= 1000 ? 160 : radius >= 500 ? 70 : 0;
+    const maxCandidates = radius >= 1000 ? 12 : radius >= 500 ? 10 : 7;
     const candidates = [];
 
     for (const stop of allStops) {
